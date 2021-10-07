@@ -1,0 +1,51 @@
+{
+  "name":        "dreamfactory/df-bigquery",
+  "description": "DreamFactory(tm) BigQuery Service",
+  "homepage":    "https://www.dreamfactory.com/",
+  "keywords":    [
+    "dreamfactory",
+    "Google",
+    "BigQuery",
+    "connector"
+  ],
+  "license":     [
+    "Apache-2.0"
+  ],
+  "authors":     [
+    {
+      "name":  "Yaroslav Mokhurenko",
+      "email": "yaroslavmo@softwareplanetgroup.com"
+    }
+  ],
+  "support":     {
+    "email":  "dspsupport@dreamfactory.com",
+    "source": "https://github.com/dreamfactorysoftware/df-bigquery",
+    "issues": "https://github.com/dreamfactorysoftware/df-bigquery/issues",
+    "wiki":   "https://wiki.dreamfactory.com"
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "require":     {
+    "dreamfactory/df-sqldb": "~0.17",
+    "dreamfactory/df-core": "~0.24",
+    "google/cloud-bigquery": "~1.23"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "@stable"
+  },
+  "autoload":    {
+    "psr-4": {
+      "DreamFactory\\Core\\BigQuery\\": "src/"
+    }
+  },
+  "extra":       {
+    "branch-alias": {
+      "dev-develop": "0.1.x-dev"
+    },
+    "laravel": {
+      "providers": [
+        "DreamFactory\\Core\\BigQuery\\ServiceProvider"
+      ]
+    }
+  }
+}
