@@ -2,13 +2,9 @@
 
 namespace DreamFactory\Core\BigQuery\Services;
 
+use DreamFactory\Core\BigQuery\Database\Schema\BigQuerySchema;
 use DreamFactory\Core\BigQuery\Resources\Table;
-use DreamFactory\Core\BigQuery\Database\Schema\Schema;
-use DreamFactory\Core\Components\RequireExtensions;
 use DreamFactory\Core\Database\Services\BaseDbService;
-use DreamFactory\Core\Exceptions\InternalServerErrorException;
-use DreamFactory\Core\Resources\BaseRestResource;
-use DreamFactory\Core\SqlDb\Services\SqlDb;
 
 /**
  * Class BigQuery
@@ -17,13 +13,11 @@ use DreamFactory\Core\SqlDb\Services\SqlDb;
  */
 class BigQuery extends BaseDbService
 {
-    use RequireExtensions;
-
     public function __construct(array $settings)
     {
         parent::__construct($settings);
 
-//        $this->config['driver'] = 'bigquery ';
+        $this->config['driver'] = 'bigquery';
 
         $prefix = '';
         $parts = ['project_id'];
@@ -44,5 +38,15 @@ class BigQuery extends BaseDbService
         ];
 
         return $handlers;
+    }
+
+    protected function initializeConnection()
+    {
+        // add config to global for reuse, todo check existence and update?
+        config(['database.connections.service.' . $this->name => $this->config]);
+        /** @type DatabaseManager $db */
+        $db = app('db');
+        $this->dbConn = $db->connection('service.' . $this->name);
+        $this->schema = new BigQuerySchema($this->dbConn);
     }
 }

@@ -18,6 +18,10 @@ class BigQueryConfig extends BaseServiceConfigModel
         'options'    => 'array'
     ];
 
+    protected $encrypted = ['application_credentials_json'];
+
+    protected $protected = ['application_credentials_json'];
+
     /**
      * {@inheritdoc}
      */
