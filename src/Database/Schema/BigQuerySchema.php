@@ -21,12 +21,12 @@ class BigQuerySchema extends Schema
     /**
      * @const string Quoting characters
      */
-//    const LEFT_QUOTE_CHARACTER = '`';
+    const LEFT_QUOTE_CHARACTER = '`';
 
     /**
      * @const string Quoting characters
      */
-//    const RIGHT_QUOTE_CHARACTER = '`';
+    const RIGHT_QUOTE_CHARACTER = '`';
 
 
     /** @var  BigQueryConnection */
@@ -46,7 +46,7 @@ class BigQuerySchema extends Schema
             return $str;
         }
 
-        return "'" . addcslashes(str_replace("'", "''", $str), "\000\n\r\\\032") . "'";
+        return "`" . addcslashes(str_replace("'", "''", $str), "\000\n\r\\\032") . "`";
     }
 
     /**
@@ -54,21 +54,17 @@ class BigQuerySchema extends Schema
      */
     protected function loadTableColumns(TableSchema $table)
     {
-        $cTable = $this->connection->getClient()->getTable($table->name);
-        $columns = $cTable->columns();
-        $primaryKeys = $cTable->primaryKey();
-        $pkNames = [];
-        foreach ($primaryKeys as $pk) {
-            $pkNames[] = $pk->name();
-        }
-
+        $client = $this->connection->getClient();
+        $dataset = $client->dataset($table->schemaName);
+        $cTable = $dataset->table($table->resourceName);
+        $columns = array_get($cTable->info(),'schema.fields');
         if (!empty($columns)) {
-            foreach ($columns as $name => $column) {
+            foreach ($columns as $column) {
                 $c = new ColumnSchema([
-                    'name' => $name,
-                    'is_primary_key' => (in_array($name, $pkNames)) ? true : false,
-                    'allow_null' => true,
-                    'db_type' => (string)$column->type(),
+                    'name' => array_get($column, 'name'),
+                    'is_primary_key' => false, // no primary keys in google's bigquery
+                    'allow_null' => array_get($column, 'mode') === 'REQUIRED' ? true : false,
+                    'db_type' => array_get($column, 'type'),
                 ]);
                 $c->quotedName = $this->quoteColumnName($c->name);
                 $this->extractType($c, $c->dbType);
@@ -106,13 +102,14 @@ class BigQuerySchema extends Schema
         $names = [];
         $tables = $dataset->tables();
         $schemaName = $dataset->id();
+        $projectId = array_get($dataset->identity(),'projectId');
         foreach ($tables as $table) {
             $name = $table->id();
             $resourceName = $name;
             $internalName = $schemaName . '.' . $resourceName;
             $name = $resourceName;
             $quotedName = $this->quoteTableName($schemaName) . '.' . $this->quoteTableName($resourceName);;
-            $settings = compact('schemaName', 'resourceName', 'name', 'internalName', 'quotedName');
+            $settings = compact('projectId', 'schemaName', 'resourceName', 'name', 'internalName', 'quotedName');
             $names[strtolower($name)] = new TableSchema($settings);
         }
 
@@ -267,10 +264,8 @@ CQL;
                         $value = str_replace('.000000', $add, $value);
                     }
                     break;
-                case 'Cassandra\Date': // construct ( int $seconds)
-//                    $x = (string)$value; // crazy class name included
-//                    $y = $value->seconds();
-                    $value = $value->toDateTime()->format('Y-m-d');
+                case 'Google\Cloud\BigQuery\Date': // construct ( int $seconds)
+                    $value = $value->formatAsString();
                     break;
                 case 'Cassandra\Time': // construct ( int $nanoseconds)
                     // create DateTime using seconds and add the remainder nanoseconds

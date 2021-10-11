@@ -57,8 +57,8 @@ class BigQueryConnection extends Connection
         $grammar = $this->getQueryGrammar();
 
         $query = new BigQueryBuilder($this, $grammar, $processor);
-
-        return $query->from($table, $as);
+        $result = $query->from($table, $as);
+        return $result;
     }
 
     /**
