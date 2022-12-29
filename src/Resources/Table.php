@@ -17,6 +17,7 @@ use DreamFactory\Core\SqlDb\Resources\Table as MySqlTable;
 use DreamFactory\Core\Utility\Session;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Query\Builder;
+use Arr;
 
 class Table extends BaseDbTableResource
 {
@@ -36,9 +37,9 @@ class Table extends BaseDbTableResource
             return null;
         }
 
-        $updates = array_get($extras, 'updates');
-        $ssFilters = array_get($extras, 'ss_filters');
-        $related = array_get($extras, 'related');
+        $updates = Arr::get($extras, 'updates');
+        $ssFilters = Arr::get($extras, 'ss_filters');
+        $related = Arr::get($extras, 'related');
         $requireMore = array_get_bool($extras, 'require_more') || !empty($related);
 
         $builder = $dbConn->table($this->transactionTableSchema->internalName);
@@ -53,7 +54,7 @@ class Table extends BaseDbTableResource
             if (is_array($this->batchRecords[0])) {
                 $temp = [];
                 foreach ($this->batchRecords as $record) {
-                    $temp[] = array_get($record, $idName->getName(true));
+                    $temp[] = Arr::get($record, $idName->getName(true));
                 }
 
                 $builder->whereIn($idName->name, $temp);
@@ -125,7 +126,7 @@ class Table extends BaseDbTableResource
                         foreach ($this->batchIds as $index => $id) {
                             $found = false;
                             foreach ($result as $record) {
-                                if ($id == array_get($record, $idName->getName(true))) {
+                                if ($id == Arr::get($record, $idName->getName(true))) {
                                     $out[$index] = $record;
                                     $found = true;
                                     break;
@@ -157,7 +158,7 @@ class Table extends BaseDbTableResource
                         foreach ($this->batchIds as $index => $id) {
                             $found = false;
                             foreach ($result as $record) {
-                                if ($id == array_get($record, $idName->getName(true))) {
+                                if ($id == Arr::get($record, $idName->getName(true))) {
                                     $out[$index] = $record;
                                     $found = true;
                                     break;
@@ -235,7 +236,7 @@ class Table extends BaseDbTableResource
      */
     public function retrieveRecordsByFilter($table, $filter = null, $params = [], $extras = [])
     {
-        $ssFilters = array_get($extras, 'ss_filters');
+        $ssFilters = Arr::get($extras, 'ss_filters');
 
         try {
             $tableSchema = $this->parent->getTableSchema($table);
@@ -276,8 +277,8 @@ class Table extends BaseDbTableResource
             throw new NotFoundException("Table '$table' does not exist in the database.");
         }
 
-        $limit = intval(array_get($extras, ApiOptions::LIMIT, 0));
-        $offset = intval(array_get($extras, ApiOptions::OFFSET, 0));
+        $limit = intval(Arr::get($extras, ApiOptions::LIMIT, 0));
+        $offset = intval(Arr::get($extras, ApiOptions::OFFSET, 0));
         $countOnly = array_get_bool($extras, ApiOptions::COUNT_ONLY);
         $includeCount = array_get_bool($extras, ApiOptions::INCLUDE_COUNT);
 
@@ -304,7 +305,7 @@ class Table extends BaseDbTableResource
         $builder->select($select);
 
         // apply the rest of the parameters
-        $order = trim(array_get($extras, ApiOptions::ORDER));
+        $order = trim(Arr::get($extras, ApiOptions::ORDER));
         if (!empty($order)) {
             if (false !== strpos($order, ';')) {
                 throw new BadRequestException('Invalid order by clause in request.');
@@ -325,7 +326,7 @@ class Table extends BaseDbTableResource
                     break;
             }
         }
-        $group = trim(array_get($extras, ApiOptions::GROUP));
+        $group = trim(Arr::get($extras, ApiOptions::GROUP));
         if (!empty($group)) {
             $group = static::fieldsToArray($group);
             $groups = $this->parseGroupBy($schema, $group);
@@ -419,10 +420,10 @@ class Table extends BaseDbTableResource
      */
     protected function parseSelect($schema, $extras)
     {
-        $fields = array_get($extras, ApiOptions::FIELDS);
+        $fields = Arr::get($extras, ApiOptions::FIELDS);
         if (empty($fields)) {
             // minimally return the id fields
-            $fields = array_get($extras, ApiOptions::ID_FIELD);
+            $fields = Arr::get($extras, ApiOptions::ID_FIELD);
             if (empty($fields)) {
                 $fields = $schema->getPrimaryKey();
                 // if still nothing, return everything
@@ -446,7 +447,7 @@ class Table extends BaseDbTableResource
             }
         } else {
             $fields = static::fieldsToArray($fields);
-            $related = array_get($extras, ApiOptions::RELATED);
+            $related = Arr::get($extras, ApiOptions::RELATED);
             $allRelated = ('*' === $related);
             $related = static::fieldsToArray($related);
             if ($allRelated || !empty($related) || $schema->fetchRequiresRelations) {
@@ -540,20 +541,20 @@ class Table extends BaseDbTableResource
      */
     protected function buildQueryStringFromData($filter_info)
     {
-        $filters = array_get($filter_info, 'filters');
+        $filters = Arr::get($filter_info, 'filters');
         if (empty($filters)) {
             return null;
         }
 
         $sql = '';
-        $combiner = array_get($filter_info, 'filter_op', DbLogicalOperators::AND_STR);
+        $combiner = Arr::get($filter_info, 'filter_op', DbLogicalOperators::AND_STR);
         foreach ($filters as $key => $filter) {
             if (!empty($sql)) {
                 $sql .= " $combiner ";
             }
 
-            $name = array_get($filter, 'name');
-            $op = strtoupper(array_get($filter, 'operator'));
+            $name = Arr::get($filter, 'name');
+            $op = strtoupper(Arr::get($filter, 'operator'));
             if (empty($name) || empty($op)) {
                 // log and bail
                 throw new InternalServerErrorException('Invalid server-side filter configuration detected.');
@@ -562,7 +563,7 @@ class Table extends BaseDbTableResource
             if (DbComparisonOperators::requiresNoValue($op)) {
                 $sql .= "($name $op)";
             } else {
-                $value = array_get($filter, 'value');
+                $value = Arr::get($filter, 'value');
                 $sql .= "($name $op $value)";
             }
         }
@@ -649,7 +650,7 @@ class Table extends BaseDbTableResource
                     }
                 }
                 /** @type ColumnSchema $info */
-                if (null === $info = array_get($fields_info, strtolower($field))) {
+                if (null === $info = Arr::get($fields_info, strtolower($field))) {
                     // This could be SQL injection attempt or bad field
                     throw new BadRequestException("Invalid or unparsable field in filter request: '$field'");
                 }

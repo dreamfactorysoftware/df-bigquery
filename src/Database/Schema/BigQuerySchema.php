@@ -15,6 +15,7 @@ use DreamFactory\Core\Exceptions\InternalServerErrorException;
 use DreamFactory\Core\Exceptions\NotImplementedException;
 use DreamFactory\Core\SqlDb\Database\Schema\SqlSchema;
 use DreamFactory\Core\Database\Components\Schema;
+use Arr;
 
 class BigQuerySchema extends Schema
 {
@@ -57,14 +58,14 @@ class BigQuerySchema extends Schema
         $client = $this->connection->getClient();
         $dataset = $client->dataset($table->schemaName);
         $cTable = $dataset->table($table->resourceName);
-        $columns = array_get($cTable->info(),'schema.fields');
+        $columns = Arr::get($cTable->info(), 'schema.fields');
         if (!empty($columns)) {
             foreach ($columns as $column) {
                 $c = new ColumnSchema([
-                    'name' => array_get($column, 'name'),
+                    'name' => Arr::get($column, 'name'),
                     'is_primary_key' => false, // no primary keys in google's bigquery
-                    'allow_null' => array_get($column, 'mode') === 'REQUIRED' ? true : false,
-                    'db_type' => array_get($column, 'type'),
+                    'allow_null' => Arr::get($column, 'mode') === 'REQUIRED' ? true : false,
+                    'db_type' => Arr::get($column, 'type'),
                 ]);
                 $c->quotedName = $this->quoteColumnName($c->name);
                 $this->extractType($c, $c->dbType);
@@ -102,7 +103,7 @@ class BigQuerySchema extends Schema
         $names = [];
         $tables = $dataset->tables();
         $schemaName = $dataset->id();
-        $projectId = array_get($dataset->identity(),'projectId');
+        $projectId = Arr::get($dataset->identity(), 'projectId');
         foreach ($tables as $table) {
             $name = $table->id();
             $resourceName = $name;
@@ -182,15 +183,15 @@ CQL;
      */
     public function alterColumn($table, $column, $definition)
     {
-        if (null !== array_get($definition, 'new_name') &&
-            array_get($definition, 'name') !== array_get($definition, 'new_name')
+        if (null !== Arr::get($definition, 'new_name') &&
+            Arr::get($definition, 'name') !== Arr::get($definition, 'new_name')
         ) {
             $cql = 'ALTER TABLE ' .
                 $table .
                 ' RENAME ' .
                 $this->quoteColumnName($column) .
                 ' TO ' .
-                $this->quoteColumnName(array_get($definition, 'new_name'));
+                $this->quoteColumnName(Arr::get($definition, 'new_name'));
         } else {
             $cql = 'ALTER TABLE ' .
                 $table .

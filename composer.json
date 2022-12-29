@@ -26,8 +26,8 @@
   "minimum-stability": "dev",
   "prefer-stable": true,
   "require":     {
-    "dreamfactory/df-sqldb": "~0.17",
-    "dreamfactory/df-core": "~0.24",
+    "dreamfactory/df-sqldb": "~1.0",
+    "dreamfactory/df-core": "~1.0",
     "google/cloud-bigquery": "~1.23"
   },
   "require-dev": {

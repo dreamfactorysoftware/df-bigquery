@@ -5,6 +5,7 @@ namespace DreamFactory\Core\BigQuery\Services;
 use DreamFactory\Core\BigQuery\Database\Schema\BigQuerySchema;
 use DreamFactory\Core\BigQuery\Resources\Table;
 use DreamFactory\Core\Database\Services\BaseDbService;
+use Arr;
 
 /**
  * Class BigQuery
@@ -22,7 +23,7 @@ class BigQuery extends BaseDbService
         $prefix = '';
         $parts = ['project_id'];
         foreach ($parts as $part) {
-            $prefix .= array_get($this->config, $part);
+            $prefix .= Arr::get($this->config, $part);
         }
 
         $this->setConfigBasedCachePrefix($prefix . ':');
