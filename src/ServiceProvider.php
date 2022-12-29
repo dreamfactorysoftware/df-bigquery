@@ -19,7 +19,7 @@ class ServiceProvider extends \Illuminate\Support\ServiceProvider
             });
         });
 
-        $this->app->resolving('db.schema', function (DbSchemaExtensions $db){
+        $this->app->resolving('df.db.schema', function (DbSchemaExtensions $db){
             $db->extend('bigquery', function ($connection){
                 return new BigQuerySchema($connection);
             });
