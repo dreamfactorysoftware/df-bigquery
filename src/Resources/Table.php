@@ -22,6 +22,89 @@ use Arr;
 
 class Table extends BaseDbTableResource
 {
+    /**
+     * Filter-based UPDATE. BigQuery has no primary keys and requires a WHERE clause on
+     * DML, so update runs by filter (not by id). Reads the affected rows back after the
+     * update for the response. Uses separate builders so the positional bindings of the
+     * UPDATE and the follow-up SELECT never mix.
+     *
+     * {@inheritdoc}
+     */
+    public function updateRecordsByFilter($table, $record, $filter = null, $params = [], $extras = [])
+    {
+        $record = static::validateAsArray($record, null, false, 'There are no fields in the record.');
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        try {
+            if (!$tableSchema = $this->parent->getTableSchema($table)) {
+                throw new NotFoundException("Table '$table' does not exist in the database.");
+            }
+            if (empty($filter)) {
+                throw new BadRequestException('Filter for update request can not be empty; BigQuery requires a WHERE clause.');
+            }
+
+            $fieldsInfo = $tableSchema->getColumns(true);
+            $parsed = $this->parseRecord($record, $fieldsInfo, $ssFilters, true);
+
+            if (!empty($parsed)) {
+                $updateBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+                $this->convertFilterToNative($updateBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+                $updateBuilder->update($parsed);
+            }
+
+            $selectBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($selectBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+
+            return $this->runQuery($table, $selectBuilder, $extras);
+        } catch (RestException $ex) {
+            throw $ex;
+        } catch (\Exception $ex) {
+            throw new InternalServerErrorException("Failed to update records in '$table'.\n{$ex->getMessage()}");
+        }
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function patchRecordsByFilter($table, $record, $filter = null, $params = [], $extras = [])
+    {
+        return $this->updateRecordsByFilter($table, $record, $filter, $params, $extras);
+    }
+
+    /**
+     * Filter-based DELETE. Captures the matching rows for the response before deleting.
+     *
+     * {@inheritdoc}
+     */
+    public function deleteRecordsByFilter($table, $filter, $params = [], $extras = [])
+    {
+        if (empty($filter)) {
+            throw new BadRequestException('Filter for delete request can not be empty; BigQuery requires a WHERE clause.');
+        }
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        try {
+            if (!$tableSchema = $this->parent->getTableSchema($table)) {
+                throw new NotFoundException("Table '$table' does not exist in the database.");
+            }
+            $fieldsInfo = $tableSchema->getColumns(true);
+
+            // grab the rows before they're gone
+            $selectBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($selectBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+            $results = $this->runQuery($table, $selectBuilder, $extras);
+
+            $deleteBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($deleteBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+            $deleteBuilder->delete();
+
+            return $results;
+        } catch (RestException $ex) {
+            throw $ex;
+        } catch (\Exception $ex) {
+            throw new InternalServerErrorException("Failed to delete records from '$table'.\n{$ex->getMessage()}");
+        }
+    }
 
     /**
      * {@inheritdoc}
