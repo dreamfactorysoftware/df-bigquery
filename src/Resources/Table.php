@@ -107,176 +107,83 @@ class Table extends BaseDbTableResource
     }
 
     /**
+     * Commit the batched id-based operations (PUT/PATCH/DELETE/GET by id or ?ids=).
+     * BigQuery has no primary keys, so id-based ops require an explicit id_field; the
+     * batched ids become a WHERE ... IN (...) filter and run as DML. Unlike the SQL
+     * connectors, we do NOT assert affected-rowcount == id-count: BigQuery enforces no
+     * uniqueness, so a filter may legitimately match zero or many rows per id.
+     *
      * {@inheritdoc}
      */
     protected function commitTransaction($extras = null)
     {
-        return [];
-        $dbConn = $this->parent->getConnection();
-        if (empty($this->batchRecords) && empty($this->batchIds)) {
-            if (0 < $dbConn->transactionLevel()) {
-                $dbConn->commit();
-            }
-
+        // POST/insert is handled inline in addToTransaction and leaves nothing batched.
+        if (empty($this->batchIds)) {
             return null;
         }
 
-        $updates = Arr::get($extras, 'updates');
-        $ssFilters = Arr::get($extras, 'ss_filters');
-        $related = Arr::get($extras, 'related');
-        $requireMore = array_get_bool($extras, 'require_more') || !empty($related);
-
-        $builder = $dbConn->table($this->transactionTableSchema->internalName);
-
         /** @type ColumnSchema $idName */
-        $idName = (isset($this->tableIdsInfo, $this->tableIdsInfo[0])) ? $this->tableIdsInfo[0] : null;
+        $idName = (isset($this->tableIdsInfo[0])) ? $this->tableIdsInfo[0] : null;
         if (empty($idName)) {
-            throw new BadRequestException('No valid identifier found for this table.');
+            throw new BadRequestException(
+                'BigQuery has no primary keys; supply an id_field to update, delete or fetch by id, or use a filter.'
+            );
         }
 
-        if (!empty($this->batchRecords)) {
-            if (is_array($this->batchRecords[0])) {
-                $temp = [];
-                foreach ($this->batchRecords as $record) {
-                    $temp[] = Arr::get($record, $idName->getName(true));
-                }
+        $extras = (array)$extras;
+        $ssFilters = Arr::get($extras, 'ss_filters');
+        $updates = Arr::get($extras, 'updates');
+        $ids = $this->batchIds;
 
-                $builder->whereIn($idName->name, $temp);
-            } else {
-                $builder->whereIn($idName->name, $this->batchRecords);
+        // Fresh builder per statement so the positional bindings of a mutation and its
+        // follow-up SELECT never mix.
+        $matched = function () use ($idName, $ids, $ssFilters) {
+            $b = $this->parent->getConnection()->table($this->transactionTableSchema->internalName);
+            $b->whereIn($idName->name, $ids);
+            $serverFilter = $this->buildQueryStringFromData($ssFilters);
+            if (!empty($serverFilter)) {
+                Session::replaceLookups($serverFilter);
+                $params = [];
+                $filterString = $this->parseFilterString($serverFilter, $params, $this->tableFieldsInfo);
+                $b->whereRaw($filterString, $params);
             }
-        } else {
-            $builder->whereIn($idName->name, $this->batchIds);
-        }
 
-        $serverFilter = $this->buildQueryStringFromData($ssFilters);
-        if (!empty($serverFilter)) {
-            Session::replaceLookups($serverFilter);
-            $params = [];
-            $filterString = $this->parseFilterString($serverFilter, $params, $this->tableFieldsInfo);
-            $builder->whereRaw($filterString, $params);
-        }
+            return $b;
+        };
 
         $out = [];
-        $action = $this->getAction();
-        if (!empty($this->batchRecords)) {
-            if (1 == count($this->tableIdsInfo)) {
-                // records are used to retrieve extras
-                // ids array are now more like records
-                $result = $this->runQuery($this->transactionTable, $builder, $extras);
-                if (empty($result)) {
-                    throw new NotFoundException('No records were found using the given identifiers.');
+        switch ($this->getAction()) {
+            case Verbs::PUT:
+            case Verbs::PATCH:
+                if (!empty($updates)) {
+                    $parsed = $this->parseRecord($updates, $this->tableFieldsInfo, $ssFilters, true);
+                    if (!empty($parsed)) {
+                        $matched()->update($parsed);
+                    }
                 }
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                break;
 
-                $out = $result;
-            } else {
-                $out = $this->retrieveRecords($this->transactionTable, $this->batchRecords, $extras);
-            }
+            case Verbs::DELETE:
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                $matched()->delete();
+                break;
 
-            $this->batchRecords = [];
-        } elseif (!empty($this->batchIds)) {
-            switch ($action) {
-                case Verbs::PUT:
-                case Verbs::PATCH:
-                    if (!empty($updates)) {
-                        $parsed = $this->parseRecord($updates, $this->tableFieldsInfo, $ssFilters, true);
-                        if (!empty($parsed)) {
-                            $rows = $builder->update($parsed);
-                            if (count($this->batchIds) !== $rows) {
-                                throw new BadRequestException('Batch Error: Not all requested records could be updated.');
-                            }
-                        }
+            case Verbs::GET:
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                break;
 
-
-                        if ($requireMore) {
-                            $result = $this->runQuery(
-                                $this->transactionTable,
-                                $builder,
-                                $extras
-                            );
-
-                            $out = $result;
-                        }
-                    }
-                    break;
-
-                case Verbs::DELETE:
-                    $result = $this->runQuery(
-                        $this->transactionTable,
-                        $builder,
-                        $extras
-                    );
-                    if (count($this->batchIds) !== count($result)) {
-                        foreach ($this->batchIds as $index => $id) {
-                            $found = false;
-                            foreach ($result as $record) {
-                                if ($id == Arr::get($record, $idName->getName(true))) {
-                                    $out[$index] = $record;
-                                    $found = true;
-                                    break;
-                                }
-                            }
-                            if (!$found) {
-                                $out[$index] = new NotFoundException("Record with identifier '" . print_r($id,
-                                        true) . "' not found.");
-                            }
-                        }
-                    } else {
-                        $out = $result;
-                    }
-
-                    $rows = $builder->delete();
-                    if (count($this->batchIds) !== $rows) {
-                        throw new BatchException($out, 'Batch Error: Not all requested records could be deleted.');
-                    }
-                    break;
-
-                case Verbs::GET:
-                    $result = $this->runQuery(
-                        $this->transactionTable,
-                        $builder,
-                        $extras
-                    );
-
-                    if (count($this->batchIds) !== count($result)) {
-                        foreach ($this->batchIds as $index => $id) {
-                            $found = false;
-                            foreach ($result as $record) {
-                                if ($id == Arr::get($record, $idName->getName(true))) {
-                                    $out[$index] = $record;
-                                    $found = true;
-                                    break;
-                                }
-                            }
-                            if (!$found) {
-                                $out[$index] = new NotFoundException("Record with identifier '" . print_r($id,
-                                        true) . "' not found.");
-                            }
-                        }
-
-                        throw new BatchException($out, 'Batch Error: Not all requested records could be retrieved.');
-                    }
-
-                    $out = $result;
-                    break;
-
-                default:
-                    break;
-            }
-
-            if (empty($out)) {
-                $out = [];
-                foreach ($this->batchIds as $id) {
-                    $out[] = [$idName->getName(true) => $id];
-                }
-            }
-
-            $this->batchIds = [];
+            default:
+                break;
         }
 
-        if (0 < $dbConn->transactionLevel()) {
-            $dbConn->commit();
+        if (empty($out)) {
+            foreach ($ids as $id) {
+                $out[] = [$idName->getName(true) => $id];
+            }
         }
+
+        $this->batchIds = [];
 
         return $out;
     }
