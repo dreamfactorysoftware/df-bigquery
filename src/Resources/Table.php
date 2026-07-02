@@ -9,6 +9,7 @@ use DreamFactory\Core\Database\Schema\TableSchema;
 use DreamFactory\Core\Enums\ApiOptions;
 use DreamFactory\Core\Enums\DbComparisonOperators;
 use DreamFactory\Core\Enums\DbLogicalOperators;
+use DreamFactory\Core\Enums\Verbs;
 use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Exceptions\InternalServerErrorException;
 use DreamFactory\Core\Exceptions\NotFoundException;
@@ -208,15 +209,14 @@ class Table extends BaseDbTableResource
      */
     protected function getIdsInfo($table, $fields_info = null, &$requested_fields = null, $requested_types = null)
     {
-        return [];
+        // BigQuery has no primary keys, so an id can only come from an explicit
+        // id_field on the request. With none requested, there are no id columns
+        // (getPrimaryKeys returns []); update/delete-by-id therefore require id_field.
         $idsInfo = [];
         if (empty($requested_fields)) {
+            // BigQuery has no primary keys, so with no explicit id_field there are
+            // no id columns to derive (the old base's getPrimaryKeys() is gone anyway).
             $requested_fields = [];
-            /** @type ColumnSchema[] $idsInfo */
-            $idsInfo = static::getPrimaryKeys($fields_info);
-            foreach ($idsInfo as $info) {
-                $requested_fields[] = $info->getName(true);
-            }
         } else {
             if (false !== $requested_fields = static::validateAsArray($requested_fields, ',')) {
                 foreach ($requested_fields as $field) {
@@ -229,6 +229,53 @@ class Table extends BaseDbTableResource
         }
 
         return $idsInfo;
+    }
+
+    /**
+     * BigQuery write path. Unlike the SQL/PDO connectors this was forked from,
+     * BigQuery has no auto-increment/lastInsertId and no client transactions, so
+     * INSERT runs here per-record and the record is echoed back (its return value
+     * becomes the per-record result in createRecords). Ids are client-supplied.
+     * PUT/PATCH/DELETE by id are queued for commitTransaction (see phase notes).
+     *
+     * {@inheritdoc}
+     */
+    protected function addToTransaction(
+        $record = null,
+        $id = null,
+        $extras = null,
+        /** @noinspection PhpUnusedParameterInspection */
+        $rollback = false,
+        /** @noinspection PhpUnusedParameterInspection */
+        $continue = false,
+        /** @noinspection PhpUnusedParameterInspection */
+        $single = false
+    ) {
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        if (Verbs::POST === $this->getAction()) {
+            $parsed = $this->parseRecord($record, $this->tableFieldsInfo, $ssFilters);
+            if (empty($parsed)) {
+                throw new BadRequestException('No valid fields were found in record.');
+            }
+
+            $builder = $this->parent->getConnection()->table($this->transactionTableSchema->internalName);
+            if (!$builder->insert($parsed)) {
+                throw new InternalServerErrorException('Record insert failed.');
+            }
+
+            return $record;
+        }
+
+        // PUT/PATCH/DELETE: queue for commitTransaction.
+        if (!is_null($record)) {
+            $this->batchRecords[] = $record;
+        }
+        if (!is_null($id)) {
+            $this->batchIds[] = $id;
+        }
+
+        return null;
     }
 
     /**
