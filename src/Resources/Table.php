@@ -14,7 +14,6 @@ use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Exceptions\InternalServerErrorException;
 use DreamFactory\Core\Exceptions\NotFoundException;
 use DreamFactory\Core\Exceptions\RestException;
-use DreamFactory\Core\SqlDb\Resources\Table as MySqlTable;
 use DreamFactory\Core\Utility\Session;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Query\Builder;
