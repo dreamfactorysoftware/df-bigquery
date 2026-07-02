@@ -6,6 +6,7 @@ use DreamFactory\Core\BigQuery\Components\BigQueryClient;
 use DreamFactory\Core\BigQuery\Database\Query\BigQueryBuilder;
 use DreamFactory\Core\BigQuery\Database\Query\Grammars\BigQueryGrammar;
 use DreamFactory\Core\BigQuery\Database\Query\Processors\BigQueryProcessor;
+use DreamFactory\Core\Exceptions\InternalServerErrorException;
 use Illuminate\Database\Connection;
 
 class BigQueryConnection extends Connection
@@ -146,9 +147,12 @@ class BigQueryConnection extends Connection
         $queryJobConfig = $this->client->query($query);
 
         if (!empty($bindings)) {
-            return $this->client->runQuery($queryJobConfig, ['arguments' => $bindings]);
-        } else {
-            return $this->client->runQuery($queryJobConfig);
+            // BigQuery ignores an 'arguments' option on runQuery(); parameters must be
+            // attached to the job config. A non-associative array selects positional (?)
+            // mode, which matches the placeholders the grammar and parseFilterValue emit.
+            $queryJobConfig = $queryJobConfig->parameters(array_values($bindings));
         }
+
+        return $this->client->runQuery($queryJobConfig);
     }
 }

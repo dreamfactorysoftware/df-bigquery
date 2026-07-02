@@ -465,6 +465,7 @@ class Table extends BaseDbTableResource
                     }
                 }
             }
+            $hasGroup = !empty(Arr::get($extras, ApiOptions::GROUP));
             foreach ($fields as $field) {
                 if ($fieldInfo = $schema->getColumn($field, true)) {
                     $out = $this->parseFieldForSelect($fieldInfo);
@@ -473,13 +474,133 @@ class Table extends BaseDbTableResource
                     } else {
                         $outArray[] = $out;
                     }
+                } elseif ($hasGroup && ($aggExpr = $this->parseAggregateExpression($schema, $field))) {
+                    $outArray[] = $aggExpr;
                 } else {
                     throw new BadRequestException('Invalid field requested: ' . $field);
                 }
             }
         }
 
+        return empty($outArray) ? ['*'] : $outArray;
+    }
+
+    /**
+     * Split a comma-delimited fields string into an array. Ported from df-sqldb;
+     * the modern df-database base no longer provides this to the connector.
+     */
+    protected static function fieldsToArray($fields)
+    {
+        if (empty($fields) || (ApiOptions::FIELDS_ALL === $fields)) {
+            return [];
+        }
+
+        return (!is_array($fields)) ? array_map('trim', explode(',', trim($fields, ','))) : $fields;
+    }
+
+    /**
+     * Validate group-by fields against the schema. Ported from df-sqldb.
+     *
+     * @param TableSchema $schema
+     * @param array       $fields
+     * @return array
+     * @throws BadRequestException
+     */
+    protected function parseGroupBy($schema, $fields = null)
+    {
+        $outArray = [];
+        if (!empty($fields)) {
+            foreach ($fields as $field) {
+                if ($fieldInfo = $schema->getColumn($field, true)) {
+                    $outArray[] = $fieldInfo->name;
+                } else {
+                    throw new BadRequestException("Invalid or unknown field '$field' in group by clause.");
+                }
+            }
+        }
+
         return $outArray;
+    }
+
+    /**
+     * Parse an ad-hoc aggregate expression like SUM(column) or COUNT(*). Only allowed
+     * when GROUP BY is present; validates the inner column against the schema to block
+     * injection. Ported from df-sqldb.
+     *
+     * @param TableSchema $schema
+     * @param string      $field
+     * @return \Illuminate\Database\Query\Expression|null
+     */
+    protected function parseAggregateExpression($schema, $field)
+    {
+        $allowed = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX'];
+        $pattern = '/^(' . implode('|', $allowed) . ')\s*\(\s*(.+?)\s*\)$/i';
+
+        if (!preg_match($pattern, trim($field), $matches)) {
+            return null;
+        }
+
+        $func = strtoupper($matches[1]);
+        $inner = $matches[2];
+
+        if ($func === 'COUNT' && $inner === '*') {
+            return DB::raw('COUNT(*) AS COUNT_ALL');
+        }
+
+        // Reject sub-expressions / injection attempts
+        if (preg_match('/[;\'"\(\)\\\\]/', $inner)) {
+            return null;
+        }
+
+        $columnInfo = $schema->getColumn($inner, true);
+        if (!$columnInfo) {
+            return null;
+        }
+
+        $columnName = $columnInfo->name;
+        $alias = $func . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', $columnInfo->getName(true));
+
+        return DB::raw($func . '(' . $this->parent->getConnection()->getQueryGrammar()->wrap($columnName) . ') AS ' . $alias);
+    }
+
+    /**
+     * Convert a single filter value into a bound placeholder. Ported from df-sqldb;
+     * without it every filtered query fatals with "undefined method parseFilterValue".
+     *
+     * @param mixed        $value
+     * @param ColumnSchema $info
+     * @param array        $out_params
+     * @param array        $in_params
+     * @return string
+     */
+    protected function parseFilterValue($value, ColumnSchema $info, array &$out_params, array $in_params = [])
+    {
+        // if a named replacement parameter, un-name it because Laravel can't handle named parameters
+        if (is_array($in_params) && (0 === strpos($value, ':'))) {
+            if (array_key_exists($value, $in_params)) {
+                $value = $in_params[$value];
+            }
+        }
+
+        // remove quoting on strings if used, i.e. 1.x required them
+        if (is_string($value)) {
+            if ((0 === strcmp("'" . trim($value, "'") . "'", $value)) ||
+                (0 === strcmp('"' . trim($value, '"') . '"', $value))
+            ) {
+                $value = substr($value, 1, -1);
+            } elseif ((0 === strpos($value, '(')) && ((strlen($value) - 1) === strrpos($value, ')'))) {
+                // function call
+                return $value;
+            }
+        }
+
+        // anything else schema specific
+        $value = $this->parent->getSchema()->typecastToNative($value, $info);
+
+        $out_params[] = $value;
+        $value = '?';
+
+        return $value;
     }
 
 
