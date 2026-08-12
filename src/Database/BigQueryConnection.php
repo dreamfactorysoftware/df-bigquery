@@ -16,6 +16,9 @@ class BigQueryConnection extends Connection
 
     public function __construct(array $config)
     {
+        $this->config = $config;
+        $this->database = $config['database'] ?? '';
+        $this->tablePrefix = $config['prefix'] ?? '';
         $this->client = BigQueryClient::createForConfig($config);
         $this->useDefaultPostProcessor();
         $this->useDefaultQueryGrammar();
@@ -24,7 +27,7 @@ class BigQueryConnection extends Connection
     /**
      * @return \DreamFactory\Core\BigQuery\Database\Query\Processors\BigQueryProcessor
      */
-    public function getDefaultPostProcessor()
+    protected function getDefaultPostProcessor()
     {
         return new BigQueryProcessor();
     }
@@ -32,9 +35,9 @@ class BigQueryConnection extends Connection
     /**
      * @return \DreamFactory\Core\BigQuery\Database\Query\Grammars\BigQueryGrammar
      */
-    public function getDefaultQueryGrammar()
+    protected function getDefaultQueryGrammar()
     {
-        return new BigQueryGrammar();
+        return new BigQueryGrammar($this);
     }
 
     /**
@@ -69,7 +72,7 @@ class BigQueryConnection extends Connection
      *
      * @return mixed
      */
-    public function select($query, $bindings = [], $useReadPdo = true)
+    public function select($query, $bindings = [], $useReadPdo = true, array $fetchUsing = [])
     {
         return $this->statement($query, $bindings);
     }
