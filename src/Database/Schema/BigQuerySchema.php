@@ -3,17 +3,9 @@
 namespace DreamFactory\Core\BigQuery\Database\Schema;
 
 use DreamFactory\Core\BigQuery\Database\BigQueryConnection;
-use DreamFactory\Core\Database\Components\DataReader;
 use DreamFactory\Core\Database\Schema\ColumnSchema;
-use DreamFactory\Core\Database\Schema\ParameterSchema;
-use DreamFactory\Core\Database\Schema\ProcedureSchema;
-use DreamFactory\Core\Database\Schema\RoutineSchema;
 use DreamFactory\Core\Database\Schema\TableSchema;
-use DreamFactory\Core\Enums\DbResourceTypes;
-use DreamFactory\Core\Enums\DbSimpleTypes;
-use DreamFactory\Core\Exceptions\InternalServerErrorException;
-use DreamFactory\Core\Exceptions\NotImplementedException;
-use DreamFactory\Core\SqlDb\Database\Schema\SqlSchema;
+use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Database\Components\Schema;
 use Arr;
 
@@ -64,7 +56,8 @@ class BigQuerySchema extends Schema
                 $c = new ColumnSchema([
                     'name' => Arr::get($column, 'name'),
                     'is_primary_key' => false, // no primary keys in google's bigquery
-                    'allow_null' => Arr::get($column, 'mode') === 'REQUIRED' ? true : false,
+                    // REQUIRED => NOT NULL; NULLABLE/REPEATED => nullable
+                    'allow_null' => Arr::get($column, 'mode') !== 'REQUIRED',
                     'db_type' => Arr::get($column, 'type'),
                 ]);
                 $c->quotedName = $this->quoteColumnName($c->name);
@@ -229,262 +222,44 @@ CQL;
             return null;
         }
 
-        if ($obj = $this->convertToNativeType($value, $field_info->dbType)) {
-            return $obj;
-        }
-
+        // BigQuery DML runs through parameterized query jobs; the Google client's
+        // ValueMapper maps PHP scalars and DateTime values to the correct BigQuery
+        // parameter type. So we normalize to a plain scalar via the base typecaster
+        // and let the SDK handle the native mapping (no driver value objects here,
+        // unlike the SQL/PDO connectors this was originally forked from).
         return parent::typecastToNative($value, $field_info, $allow_null);
     }
 
+    /**
+     * Normalize the value objects the BigQuery client returns for temporal, numeric
+     * and byte columns (Google\Cloud\BigQuery\{Date,Time,Timestamp,Numeric,BigNumeric,
+     * Bytes,Geography} and \DateTime for DATETIME) into plain scalars for JSON output.
+     * Plain scalars pass through untouched.
+     *
+     * @param mixed $value
+     * @return mixed
+     */
     protected function unwrapNativeType($value)
     {
-        // handle object types returned by driver
-        if (is_object($value)) {
-            switch ($cassClass = get_class($value)) {
-                case 'Cassandra\Uuid': // constructs with same generated string
-                    $value = $value->uuid();
-                    break;
-                case 'Cassandra\Timeuuid': // construct( int $seconds )
-//                    $x = $value->time(); // seconds
-//                    $y = $value->toDateTime()->format('Y-m-d H:i:s.uO');
-                    $value = $value->uuid();
-                    break;
-                case 'Cassandra\Timestamp': // __construct ( int $seconds, int $microseconds )
-//                    $x = $value->time(); // seconds
-//                    $y = $value->microtime(false); // microseconds string '0.u seconds'
-//                    $z = $value->microtime(true); // string 'seconds.mil' milliseconds
-                    $milliseconds = (string)$value; // milliseconds string
-                    $add = '.' . substr($milliseconds, -3);
+        if (!is_object($value)) {
+            return $value;
+        }
 
-                    // Their toDateTime drops millisecond accuracy, will add it back
-                    if (version_compare(PHP_VERSION, '7.0.0', '>=')) {
-                        $value = $value->toDateTime()->format('Y-m-d H:i:s.vO'); // milliseconds best accuracy
-                        $value = str_replace('.000', $add, $value);
-                    } else {
-                        $value = $value->toDateTime()->format('Y-m-d H:i:s.uO');
-                        $value = str_replace('.000000', $add, $value);
-                    }
-                    break;
-                case 'Google\Cloud\BigQuery\Date': // construct ( int $seconds)
-                    $value = $value->formatAsString();
-                    break;
-                case 'Cassandra\Time': // construct ( int $nanoseconds)
-                    // create DateTime using seconds and add the remainder nanoseconds
-                    $datetime = new \DateTime('@' . $value->seconds());
-                    $nanoseconds = (int)(string)$value; // nanoseconds
-                    $remainder = $nanoseconds % 1000000000;
-                    $value = $datetime->format('H:i:s') . '.' . str_pad($remainder, 9, '0', STR_PAD_LEFT);
-                    break;
-                case 'Cassandra\Blob':
-//                    $x = (string)$value; // hexadecimal string
-//                    $y = $value->bytes(); // hexadecimal string
-                    $value = $value->toBinaryString();
-                    break;
-                case 'Cassandra\Inet':
-//                    $x = $value->address();
-                    $value = (string)$value;
-                    break;
-                case 'Cassandra\Decimal':
-//                    $x = $value->value(); // string value without scale
-//                    $scale = $value->scale();
-                    $value = (string)$value; // E notation?
-                    break;
-                case 'Cassandra\Float':
-//                    $x = $value->value(); // shortens based on float() behavior
-                    $value = (string)$value;
-                    break;
-                case 'Cassandra\Bigint':
-                case 'Cassandra\Varint':
-                    $value = $value->value(); // should be string as these are typically too large for PHP
-                    break;
-                case 'Cassandra\Smallint':
-                case 'Cassandra\Tinyint':
-                    $value = $value->value();
-                    break;
-                case 'Cassandra\Collection': // aka List type
-                    $out = [];
-                    foreach ($value->values() as $val) {
-                        $out[] = $this->typecastToClient($val, $value->type()->valueType()->name());
-                    }
-                    $value = $out;
-                    break;
-                case 'Cassandra\Set':
-                    $out = [];
-                    foreach ($value->values() as $val) {
-                        $out[] = $this->typecastToClient($val, $value->type()->valueType()->name());
-                    }
-                    $value = $out;
-                    break;
-                case 'Cassandra\Tuple':
-                    $out = [];
-                    $types = $value->type()->types();
-                    foreach ($value->values() as $ndx => $val) {
-                        $out[] = $this->typecastToClient($val, $types[$ndx]->name());
-                    }
-                    $value = $out;
-                    break;
-                case 'Cassandra\Map':
-                    $out = [];
-                    $keys = $value->keys();
-                    foreach ($value->values() as $ndx => $val) {
-                        $out[$this->typecastToClient($keys[$ndx],
-                            $value->type()->keyType()->name())] = $this->typecastToClient($val,
-                            $value->type()->valueType()->name());
-                    }
-                    $value = $out;
-                    break;
-            }
+        // Every BigQuery value object exposes formatAsString() (Date/Time/Timestamp/
+        // Numeric/BigNumeric/Bytes/Geography).
+        if (method_exists($value, 'formatAsString')) {
+            return $value->formatAsString();
+        }
+
+        // DATETIME columns come back as a plain \DateTime.
+        if ($value instanceof \DateTimeInterface) {
+            return $value->format(\DateTime::ATOM);
+        }
+
+        if (method_exists($value, '__toString')) {
+            return (string)$value;
         }
 
         return $value;
-    }
-
-    protected function convertToNativeType($value, $type)
-    {
-        $simpleType = $type;
-        $extra = null;
-        if (false !== $pos = strpos($type, '<')) {
-            $simpleType = substr($type, 0, $pos);
-            $extra = substr($type, $pos + 1, -1); // strip outer <>
-        }
-        switch (strtolower($simpleType)) {
-            // datetime and such
-            case DbSimpleTypes::TYPE_DATE:
-                if (is_numeric($value)) {
-                    return new \Cassandra\Date((int)$value); // must be seconds, check doc as this is weird
-                } else {
-                    return \Cassandra\Date::fromDateTime(new \DateTime($value));
-                }
-                break;
-            case DbSimpleTypes::TYPE_TIME:
-                if (is_numeric($value)) {
-                    return new \Cassandra\Time($value); // must be nanoseconds
-                } else {
-                    if (false !== $pos = strpos($value, '.')) {
-                        // string may include nanoseconds
-                        $seconds = substr($value, 0, $pos);
-                        $nano = substr($value, $pos + 1);
-                        $seconds = strtotime('1970-01-01 ' . $seconds);
-                        $nanoseconds = $seconds . str_pad($nano, 9, '0', STR_PAD_RIGHT);
-
-                        return new \Cassandra\Time($nanoseconds);
-                    } else {
-                        return \Cassandra\Time::fromDateTime(new \DateTime($value));
-                    }
-                }
-                break;
-            case DbSimpleTypes::TYPE_TIMESTAMP:
-                if (is_numeric($value)) {
-                    return new \Cassandra\Timestamp((int)$value); // must be seconds
-                } elseif (empty($value) || (0 === strcasecmp($value, 'now()'))) {
-                    return new \Cassandra\Timestamp();
-                } elseif (false !== $seconds = strtotime($value)) {
-                    // may have lost millisecond precision here, see if we can make up for it
-                    $microseconds = 0;
-                    if (false !== $pos = strpos($value, '.')) {
-                        $len = (false !== $plus = strpos($value, '+')) ? $plus - ($pos + 1) : null;
-                        $micro = '0.' . substr($value, $pos + 1, $len);
-                        $microseconds = floatval($micro) * 1000000;
-                    }
-
-                    return new \Cassandra\Timestamp($seconds, $microseconds);
-                }
-                break;
-            case DbSimpleTypes::TYPE_TIME_UUID:
-                if (is_numeric($value)) {
-                    return new \Cassandra\Timeuuid((int)$value); // must be seconds
-                } elseif (empty($value) || (0 === strcasecmp($value, 'now()'))) {
-                    return new \Cassandra\Timeuuid();
-                } elseif (false !== $seconds = strtotime($value)) {
-                    return new \Cassandra\Timeuuid($seconds);
-                } else {
-                    throw new BadRequestException('TIME UUID type can only be set with null, or seconds, or valid formatted time.');
-                }
-                break;
-            case DbSimpleTypes::TYPE_UUID:
-                if (empty($value) || (0 === strcasecmp($value, 'uuid()'))) {
-                    return new \Cassandra\Uuid(Uuid::uuid4());
-                } else {
-                    return new \Cassandra\Uuid($value);
-                }
-            case DbSimpleTypes::TYPE_BINARY:
-                return new \Cassandra\Blob((string)$value);
-
-            // some fancy numbers
-            case 'var_int':
-                return new \Cassandra\Varint((string)$value);
-            case DbSimpleTypes::TYPE_BIG_INT:
-                return new \Cassandra\Bigint((string)$value);
-            case DbSimpleTypes::TYPE_DECIMAL:
-                return new \Cassandra\Decimal((string)$value);
-            case DbSimpleTypes::TYPE_FLOAT:
-                return new \Cassandra\Float($value);
-            case DbSimpleTypes::TYPE_SMALL_INT:
-                return new \Cassandra\Smallint($value);
-            case DbSimpleTypes::TYPE_TINY_INT:
-                return new \Cassandra\Tinyint($value);
-            case 'list':
-                $obj = new \Cassandra\Collection($extra);
-                foreach ($value as $val) {
-                    if (is_object($val)) {
-                        $newVal = $this->convertToNativeType($val, $extra);
-                        if (!is_null($newVal)) { // collections don't allow null values
-                            $val = $newVal;
-                        }
-                    }
-                    $obj->add($val);
-                }
-
-                return $obj;
-            case 'set':
-                $obj = new \Cassandra\Set($extra);
-                foreach ($value as $val) {
-                    if (is_object($val)) {
-                        $newVal = $this->convertToNativeType($val, $extra);
-                        if (!is_null($newVal)) { // collections don't allow null values
-                            $val = $newVal;
-                        }
-                    }
-                    $obj->add($val);
-                }
-
-                return $obj;
-            case 'tuple':
-                throw new BadRequestException('Tuple data type not currently supported for write.');
-                break;
-//                        $types = strtolower(strstr($field_info->dbType, '<'));
-//                        $obj = new \Cassandra\Tuple($types);
-//
-//                        return $obj;
-//                $tupleType = \Cassandra\Type::tuple(\Cassandra\Type::text(), \Cassandra\Type::text(),
-//                    \Cassandra\Type::int());
-//                $tupleType->create('Phoenix', '9042 Cassandra Lane', 85023)
-            case 'map':
-                $types = array_map('trim', explode(',', strtolower($extra)));
-                $obj = new \Cassandra\Map($types[0], $types[1]);
-                foreach ($value as $key => $val) {
-                    if (is_object($key)) {
-                        $newKey = $this->convertToNativeType($key, $types[0]);
-                        if (!is_null($newKey)) { // collections don't allow null values
-                            $key = $newKey;
-                        }
-                    }
-                    if (is_object($val)) {
-                        $newVal = $this->convertToNativeType($val, $types[1]);
-                        if (!is_null($newVal)) { // collections don't allow null values
-                            $val = $newVal;
-                        }
-                    }
-                    $obj->set($key, $val);
-                }
-
-                return $obj;
-
-            // catch any other weird ones
-            case 'inet':
-                return new \Cassandra\Inet((string)$value);
-        }
-
-        return null;
     }
 }

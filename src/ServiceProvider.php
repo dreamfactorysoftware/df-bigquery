@@ -2,9 +2,11 @@
 namespace DreamFactory\Core\BigQuery;
 
 use DreamFactory\Core\BigQuery\Database\BigQueryConnection;
+use DreamFactory\Core\BigQuery\Database\Schema\BigQuerySchema;
 use DreamFactory\Core\BigQuery\Models\BigQueryConfig;
 use DreamFactory\Core\BigQuery\Services\BigQuery;
 use DreamFactory\Core\Components\DbSchemaExtensions;
+use DreamFactory\Core\Enums\ServiceTypeGroups;
 use DreamFactory\Core\Services\ServiceManager;
 use DreamFactory\Core\Services\ServiceType;
 use Illuminate\Database\DatabaseManager;
@@ -32,7 +34,9 @@ class ServiceProvider extends \Illuminate\Support\ServiceProvider
                     'name'            => 'bigquery',
                     'label'           => 'BigQuery',
                     'description'     => 'Service for Google Cloud BigQuery connections.',
-                    'group'           => 'Big Data',
+                    // DATABASE (not 'Big Data') so the MCP server's DB discovery
+                    // (McpStreamController::getAvailableServices) exposes it as tools.
+                    'group'           => ServiceTypeGroups::DATABASE,
                     'config_handler'  => BigQueryConfig::class,
                     'factory'         => function ($config) {
                         return new BigQuery($config);
