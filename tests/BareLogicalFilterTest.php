@@ -4,6 +4,7 @@ namespace DreamFactory\Core\BigQuery\Tests;
 
 use DreamFactory\Core\BigQuery\Resources\Table;
 use DreamFactory\Core\Database\Schema\ColumnSchema;
+use DreamFactory\Core\Enums\DbLogicalOperators;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
@@ -67,10 +68,25 @@ class BareLogicalFilterTest extends TestCase
     #[DataProvider('cases')]
     public function testBareConditionsParseLikeParenthesized(string $bare): void
     {
+        if (!method_exists(DbLogicalOperators::class, 'wrapBareConditions')) {
+            $this->markTestSkipped('needs df-core#177');
+        }
         $parenthesized = $this->parenthesize($bare);
         $expected = $this->parseFilter($parenthesized);
         $this->assertStringContainsString('`b`', $expected, 'sanity: both fields present in parenthesized form');
         $this->assertSame($expected, $this->parseFilter($bare));
+    }
+
+    /**
+     * A parenthesized filter must parse on any df-core, including ones that
+     * predate DbLogicalOperators::wrapBareConditions().
+     */
+    public function testParenthesizedFilterParsesOnAnyCore(): void
+    {
+        $sql = $this->parseFilter('(a is null) OR (b is null)');
+        $this->assertStringContainsString('`a`', $sql);
+        $this->assertStringContainsString('`b`', $sql);
+        $this->assertStringContainsString('OR', $sql);
     }
 
     private function parenthesize(string $bare): string
