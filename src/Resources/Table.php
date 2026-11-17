@@ -9,11 +9,11 @@ use DreamFactory\Core\Database\Schema\TableSchema;
 use DreamFactory\Core\Enums\ApiOptions;
 use DreamFactory\Core\Enums\DbComparisonOperators;
 use DreamFactory\Core\Enums\DbLogicalOperators;
+use DreamFactory\Core\Enums\Verbs;
 use DreamFactory\Core\Exceptions\BadRequestException;
 use DreamFactory\Core\Exceptions\InternalServerErrorException;
 use DreamFactory\Core\Exceptions\NotFoundException;
 use DreamFactory\Core\Exceptions\RestException;
-use DreamFactory\Core\SqlDb\Resources\Table as MySqlTable;
 use DreamFactory\Core\Utility\Session;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Query\Builder;
@@ -21,178 +21,168 @@ use Arr;
 
 class Table extends BaseDbTableResource
 {
+    /**
+     * Filter-based UPDATE. BigQuery has no primary keys and requires a WHERE clause on
+     * DML, so update runs by filter (not by id). Reads the affected rows back after the
+     * update for the response. Uses separate builders so the positional bindings of the
+     * UPDATE and the follow-up SELECT never mix.
+     *
+     * {@inheritdoc}
+     */
+    public function updateRecordsByFilter($table, $record, $filter = null, $params = [], $extras = [])
+    {
+        $record = static::validateAsArray($record, null, false, 'There are no fields in the record.');
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        try {
+            if (!$tableSchema = $this->parent->getTableSchema($table)) {
+                throw new NotFoundException("Table '$table' does not exist in the database.");
+            }
+            if (empty($filter)) {
+                throw new BadRequestException('Filter for update request can not be empty; BigQuery requires a WHERE clause.');
+            }
+
+            $fieldsInfo = $tableSchema->getColumns(true);
+            $parsed = $this->parseRecord($record, $fieldsInfo, $ssFilters, true);
+
+            if (!empty($parsed)) {
+                $updateBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+                $this->convertFilterToNative($updateBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+                $updateBuilder->update($parsed);
+            }
+
+            $selectBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($selectBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+
+            return $this->runQuery($table, $selectBuilder, $extras);
+        } catch (RestException $ex) {
+            throw $ex;
+        } catch (\Exception $ex) {
+            throw new InternalServerErrorException("Failed to update records in '$table'.\n{$ex->getMessage()}");
+        }
+    }
 
     /**
      * {@inheritdoc}
      */
+    public function patchRecordsByFilter($table, $record, $filter = null, $params = [], $extras = [])
+    {
+        return $this->updateRecordsByFilter($table, $record, $filter, $params, $extras);
+    }
+
+    /**
+     * Filter-based DELETE. Captures the matching rows for the response before deleting.
+     *
+     * {@inheritdoc}
+     */
+    public function deleteRecordsByFilter($table, $filter, $params = [], $extras = [])
+    {
+        if (empty($filter)) {
+            throw new BadRequestException('Filter for delete request can not be empty; BigQuery requires a WHERE clause.');
+        }
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        try {
+            if (!$tableSchema = $this->parent->getTableSchema($table)) {
+                throw new NotFoundException("Table '$table' does not exist in the database.");
+            }
+            $fieldsInfo = $tableSchema->getColumns(true);
+
+            // grab the rows before they're gone
+            $selectBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($selectBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+            $results = $this->runQuery($table, $selectBuilder, $extras);
+
+            $deleteBuilder = $this->parent->getConnection()->table($tableSchema->internalName);
+            $this->convertFilterToNative($deleteBuilder, $filter, $params, $ssFilters, $fieldsInfo);
+            $deleteBuilder->delete();
+
+            return $results;
+        } catch (RestException $ex) {
+            throw $ex;
+        } catch (\Exception $ex) {
+            throw new InternalServerErrorException("Failed to delete records from '$table'.\n{$ex->getMessage()}");
+        }
+    }
+
+    /**
+     * Commit the batched id-based operations (PUT/PATCH/DELETE/GET by id or ?ids=).
+     * BigQuery has no primary keys, so id-based ops require an explicit id_field; the
+     * batched ids become a WHERE ... IN (...) filter and run as DML. Unlike the SQL
+     * connectors, we do NOT assert affected-rowcount == id-count: BigQuery enforces no
+     * uniqueness, so a filter may legitimately match zero or many rows per id.
+     *
+     * {@inheritdoc}
+     */
     protected function commitTransaction($extras = null)
     {
-        return [];
-        $dbConn = $this->parent->getConnection();
-        if (empty($this->batchRecords) && empty($this->batchIds)) {
-            if (0 < $dbConn->transactionLevel()) {
-                $dbConn->commit();
-            }
-
+        // POST/insert is handled inline in addToTransaction and leaves nothing batched.
+        if (empty($this->batchIds)) {
             return null;
         }
 
-        $updates = Arr::get($extras, 'updates');
-        $ssFilters = Arr::get($extras, 'ss_filters');
-        $related = Arr::get($extras, 'related');
-        $requireMore = array_get_bool($extras, 'require_more') || !empty($related);
-
-        $builder = $dbConn->table($this->transactionTableSchema->internalName);
-
         /** @type ColumnSchema $idName */
-        $idName = (isset($this->tableIdsInfo, $this->tableIdsInfo[0])) ? $this->tableIdsInfo[0] : null;
+        $idName = (isset($this->tableIdsInfo[0])) ? $this->tableIdsInfo[0] : null;
         if (empty($idName)) {
-            throw new BadRequestException('No valid identifier found for this table.');
+            throw new BadRequestException(
+                'BigQuery has no primary keys; supply an id_field to update, delete or fetch by id, or use a filter.'
+            );
         }
 
-        if (!empty($this->batchRecords)) {
-            if (is_array($this->batchRecords[0])) {
-                $temp = [];
-                foreach ($this->batchRecords as $record) {
-                    $temp[] = Arr::get($record, $idName->getName(true));
-                }
+        $extras = (array)$extras;
+        $ssFilters = Arr::get($extras, 'ss_filters');
+        $updates = Arr::get($extras, 'updates');
+        $ids = $this->batchIds;
 
-                $builder->whereIn($idName->name, $temp);
-            } else {
-                $builder->whereIn($idName->name, $this->batchRecords);
+        // Fresh builder per statement so the positional bindings of a mutation and its
+        // follow-up SELECT never mix.
+        $matched = function () use ($idName, $ids, $ssFilters) {
+            $b = $this->parent->getConnection()->table($this->transactionTableSchema->internalName);
+            $b->whereIn($idName->name, $ids);
+            $serverFilter = $this->buildQueryStringFromData($ssFilters);
+            if (!empty($serverFilter)) {
+                Session::replaceLookups($serverFilter);
+                $params = [];
+                $filterString = $this->parseFilterString($serverFilter, $params, $this->tableFieldsInfo);
+                $b->whereRaw($filterString, $params);
             }
-        } else {
-            $builder->whereIn($idName->name, $this->batchIds);
-        }
 
-        $serverFilter = $this->buildQueryStringFromData($ssFilters);
-        if (!empty($serverFilter)) {
-            Session::replaceLookups($serverFilter);
-            $params = [];
-            $filterString = $this->parseFilterString($serverFilter, $params, $this->tableFieldsInfo);
-            $builder->whereRaw($filterString, $params);
-        }
+            return $b;
+        };
 
         $out = [];
-        $action = $this->getAction();
-        if (!empty($this->batchRecords)) {
-            if (1 == count($this->tableIdsInfo)) {
-                // records are used to retrieve extras
-                // ids array are now more like records
-                $result = $this->runQuery($this->transactionTable, $builder, $extras);
-                if (empty($result)) {
-                    throw new NotFoundException('No records were found using the given identifiers.');
+        switch ($this->getAction()) {
+            case Verbs::PUT:
+            case Verbs::PATCH:
+                if (!empty($updates)) {
+                    $parsed = $this->parseRecord($updates, $this->tableFieldsInfo, $ssFilters, true);
+                    if (!empty($parsed)) {
+                        $matched()->update($parsed);
+                    }
                 }
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                break;
 
-                $out = $result;
-            } else {
-                $out = $this->retrieveRecords($this->transactionTable, $this->batchRecords, $extras);
-            }
+            case Verbs::DELETE:
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                $matched()->delete();
+                break;
 
-            $this->batchRecords = [];
-        } elseif (!empty($this->batchIds)) {
-            switch ($action) {
-                case Verbs::PUT:
-                case Verbs::PATCH:
-                    if (!empty($updates)) {
-                        $parsed = $this->parseRecord($updates, $this->tableFieldsInfo, $ssFilters, true);
-                        if (!empty($parsed)) {
-                            $rows = $builder->update($parsed);
-                            if (count($this->batchIds) !== $rows) {
-                                throw new BadRequestException('Batch Error: Not all requested records could be updated.');
-                            }
-                        }
+            case Verbs::GET:
+                $out = $this->runQuery($this->transactionTable, $matched(), $extras);
+                break;
 
-
-                        if ($requireMore) {
-                            $result = $this->runQuery(
-                                $this->transactionTable,
-                                $builder,
-                                $extras
-                            );
-
-                            $out = $result;
-                        }
-                    }
-                    break;
-
-                case Verbs::DELETE:
-                    $result = $this->runQuery(
-                        $this->transactionTable,
-                        $builder,
-                        $extras
-                    );
-                    if (count($this->batchIds) !== count($result)) {
-                        foreach ($this->batchIds as $index => $id) {
-                            $found = false;
-                            foreach ($result as $record) {
-                                if ($id == Arr::get($record, $idName->getName(true))) {
-                                    $out[$index] = $record;
-                                    $found = true;
-                                    break;
-                                }
-                            }
-                            if (!$found) {
-                                $out[$index] = new NotFoundException("Record with identifier '" . print_r($id,
-                                        true) . "' not found.");
-                            }
-                        }
-                    } else {
-                        $out = $result;
-                    }
-
-                    $rows = $builder->delete();
-                    if (count($this->batchIds) !== $rows) {
-                        throw new BatchException($out, 'Batch Error: Not all requested records could be deleted.');
-                    }
-                    break;
-
-                case Verbs::GET:
-                    $result = $this->runQuery(
-                        $this->transactionTable,
-                        $builder,
-                        $extras
-                    );
-
-                    if (count($this->batchIds) !== count($result)) {
-                        foreach ($this->batchIds as $index => $id) {
-                            $found = false;
-                            foreach ($result as $record) {
-                                if ($id == Arr::get($record, $idName->getName(true))) {
-                                    $out[$index] = $record;
-                                    $found = true;
-                                    break;
-                                }
-                            }
-                            if (!$found) {
-                                $out[$index] = new NotFoundException("Record with identifier '" . print_r($id,
-                                        true) . "' not found.");
-                            }
-                        }
-
-                        throw new BatchException($out, 'Batch Error: Not all requested records could be retrieved.');
-                    }
-
-                    $out = $result;
-                    break;
-
-                default:
-                    break;
-            }
-
-            if (empty($out)) {
-                $out = [];
-                foreach ($this->batchIds as $id) {
-                    $out[] = [$idName->getName(true) => $id];
-                }
-            }
-
-            $this->batchIds = [];
+            default:
+                break;
         }
 
-        if (0 < $dbConn->transactionLevel()) {
-            $dbConn->commit();
+        if (empty($out)) {
+            foreach ($ids as $id) {
+                $out[] = [$idName->getName(true) => $id];
+            }
         }
+
+        $this->batchIds = [];
 
         return $out;
     }
@@ -208,15 +198,14 @@ class Table extends BaseDbTableResource
      */
     protected function getIdsInfo($table, $fields_info = null, &$requested_fields = null, $requested_types = null)
     {
-        return [];
+        // BigQuery has no primary keys, so an id can only come from an explicit
+        // id_field on the request. With none requested, there are no id columns
+        // (getPrimaryKeys returns []); update/delete-by-id therefore require id_field.
         $idsInfo = [];
         if (empty($requested_fields)) {
+            // BigQuery has no primary keys, so with no explicit id_field there are
+            // no id columns to derive (the old base's getPrimaryKeys() is gone anyway).
             $requested_fields = [];
-            /** @type ColumnSchema[] $idsInfo */
-            $idsInfo = static::getPrimaryKeys($fields_info);
-            foreach ($idsInfo as $info) {
-                $requested_fields[] = $info->getName(true);
-            }
         } else {
             if (false !== $requested_fields = static::validateAsArray($requested_fields, ',')) {
                 foreach ($requested_fields as $field) {
@@ -229,6 +218,53 @@ class Table extends BaseDbTableResource
         }
 
         return $idsInfo;
+    }
+
+    /**
+     * BigQuery write path. Unlike the SQL/PDO connectors this was forked from,
+     * BigQuery has no auto-increment/lastInsertId and no client transactions, so
+     * INSERT runs here per-record and the record is echoed back (its return value
+     * becomes the per-record result in createRecords). Ids are client-supplied.
+     * PUT/PATCH/DELETE by id are queued for commitTransaction (see phase notes).
+     *
+     * {@inheritdoc}
+     */
+    protected function addToTransaction(
+        $record = null,
+        $id = null,
+        $extras = null,
+        /** @noinspection PhpUnusedParameterInspection */
+        $rollback = false,
+        /** @noinspection PhpUnusedParameterInspection */
+        $continue = false,
+        /** @noinspection PhpUnusedParameterInspection */
+        $single = false
+    ) {
+        $ssFilters = Arr::get($extras, 'ss_filters');
+
+        if (Verbs::POST === $this->getAction()) {
+            $parsed = $this->parseRecord($record, $this->tableFieldsInfo, $ssFilters);
+            if (empty($parsed)) {
+                throw new BadRequestException('No valid fields were found in record.');
+            }
+
+            $builder = $this->parent->getConnection()->table($this->transactionTableSchema->internalName);
+            if (!$builder->insert($parsed)) {
+                throw new InternalServerErrorException('Record insert failed.');
+            }
+
+            return $record;
+        }
+
+        // PUT/PATCH/DELETE: queue for commitTransaction.
+        if (!is_null($record)) {
+            $this->batchRecords[] = $record;
+        }
+        if (!is_null($id)) {
+            $this->batchIds[] = $id;
+        }
+
+        return null;
     }
 
     /**
@@ -465,6 +501,7 @@ class Table extends BaseDbTableResource
                     }
                 }
             }
+            $hasGroup = !empty(Arr::get($extras, ApiOptions::GROUP));
             foreach ($fields as $field) {
                 if ($fieldInfo = $schema->getColumn($field, true)) {
                     $out = $this->parseFieldForSelect($fieldInfo);
@@ -473,13 +510,133 @@ class Table extends BaseDbTableResource
                     } else {
                         $outArray[] = $out;
                     }
+                } elseif ($hasGroup && ($aggExpr = $this->parseAggregateExpression($schema, $field))) {
+                    $outArray[] = $aggExpr;
                 } else {
                     throw new BadRequestException('Invalid field requested: ' . $field);
                 }
             }
         }
 
+        return empty($outArray) ? ['*'] : $outArray;
+    }
+
+    /**
+     * Split a comma-delimited fields string into an array. Ported from df-sqldb;
+     * the modern df-database base no longer provides this to the connector.
+     */
+    protected static function fieldsToArray($fields)
+    {
+        if (empty($fields) || (ApiOptions::FIELDS_ALL === $fields)) {
+            return [];
+        }
+
+        return (!is_array($fields)) ? array_map('trim', explode(',', trim($fields, ','))) : $fields;
+    }
+
+    /**
+     * Validate group-by fields against the schema. Ported from df-sqldb.
+     *
+     * @param TableSchema $schema
+     * @param array       $fields
+     * @return array
+     * @throws BadRequestException
+     */
+    protected function parseGroupBy($schema, $fields = null)
+    {
+        $outArray = [];
+        if (!empty($fields)) {
+            foreach ($fields as $field) {
+                if ($fieldInfo = $schema->getColumn($field, true)) {
+                    $outArray[] = $fieldInfo->name;
+                } else {
+                    throw new BadRequestException("Invalid or unknown field '$field' in group by clause.");
+                }
+            }
+        }
+
         return $outArray;
+    }
+
+    /**
+     * Parse an ad-hoc aggregate expression like SUM(column) or COUNT(*). Only allowed
+     * when GROUP BY is present; validates the inner column against the schema to block
+     * injection. Ported from df-sqldb.
+     *
+     * @param TableSchema $schema
+     * @param string      $field
+     * @return \Illuminate\Database\Query\Expression|null
+     */
+    protected function parseAggregateExpression($schema, $field)
+    {
+        $allowed = ['SUM', 'COUNT', 'AVG', 'MIN', 'MAX'];
+        $pattern = '/^(' . implode('|', $allowed) . ')\s*\(\s*(.+?)\s*\)$/i';
+
+        if (!preg_match($pattern, trim($field), $matches)) {
+            return null;
+        }
+
+        $func = strtoupper($matches[1]);
+        $inner = $matches[2];
+
+        if ($func === 'COUNT' && $inner === '*') {
+            return DB::raw('COUNT(*) AS COUNT_ALL');
+        }
+
+        // Reject sub-expressions / injection attempts
+        if (preg_match('/[;\'"\(\)\\\\]/', $inner)) {
+            return null;
+        }
+
+        $columnInfo = $schema->getColumn($inner, true);
+        if (!$columnInfo) {
+            return null;
+        }
+
+        $columnName = $columnInfo->name;
+        $alias = $func . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', $columnInfo->getName(true));
+
+        return DB::raw($func . '(' . $this->parent->getConnection()->getQueryGrammar()->wrap($columnName) . ') AS ' . $alias);
+    }
+
+    /**
+     * Convert a single filter value into a bound placeholder. Ported from df-sqldb;
+     * without it every filtered query fatals with "undefined method parseFilterValue".
+     *
+     * @param mixed        $value
+     * @param ColumnSchema $info
+     * @param array        $out_params
+     * @param array        $in_params
+     * @return string
+     */
+    protected function parseFilterValue($value, ColumnSchema $info, array &$out_params, array $in_params = [])
+    {
+        // if a named replacement parameter, un-name it because Laravel can't handle named parameters
+        if (is_array($in_params) && (0 === strpos($value, ':'))) {
+            if (array_key_exists($value, $in_params)) {
+                $value = $in_params[$value];
+            }
+        }
+
+        // remove quoting on strings if used, i.e. 1.x required them
+        if (is_string($value)) {
+            if ((0 === strcmp("'" . trim($value, "'") . "'", $value)) ||
+                (0 === strcmp('"' . trim($value, '"') . '"', $value))
+            ) {
+                $value = substr($value, 1, -1);
+            } elseif ((0 === strpos($value, '(')) && ((strlen($value) - 1) === strrpos($value, ')'))) {
+                // function call
+                return $value;
+            }
+        }
+
+        // anything else schema specific
+        $value = $this->parent->getSchema()->typecastToNative($value, $info);
+
+        $out_params[] = $value;
+        $value = '?';
+
+        return $value;
     }
 
 
